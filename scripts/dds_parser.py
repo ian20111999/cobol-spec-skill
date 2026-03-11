@@ -810,16 +810,24 @@ def parse_spool_section(filepath: str, start: int, end: int,
     """
     Parse a DDS section embedded within a larger spool file.
     `start` and `end` are 1-based line numbers (inclusive).
+
+    The COPY FILE header/ruler may be outside the DDS section range,
+    so we scan backwards from `start` to find the format and ruler.
     """
     with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
         raw_lines = f.readlines()
 
     section = raw_lines[max(0, start - 1):end]
-    fmt = _detect_format(section)
-    dds_col1 = _find_dds_start_col(section, fmt)
 
+    # COPY FILE format has ONE header/ruler at the very beginning of the
+    # spool file, shared by all DDS sections. Always check the file header.
+    file_header = raw_lines[:30]
+    fmt = _detect_format(file_header)
+    dds_col1 = _find_dds_start_col(file_header, fmt)
+
+    # For metadata, use the file header (COPY FILE) or the section (SEU).
     if fmt == 'spool':
-        metadata = _extract_metadata_spool(section)
+        metadata = _extract_metadata_spool(file_header)
     else:
         metadata = _extract_metadata_seu(section)
 
