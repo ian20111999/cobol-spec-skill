@@ -54,7 +54,11 @@ def find_program_starts(records):
     re_process = re.compile(r"^\s*PROCESS\s+.*GRAPHIC", re.IGNORECASE)
     re_pgmid = re.compile(r"^\s*PROGRAM-ID\.\s+(\w+)", re.IGNORECASE)
     re_cl_pgm = re.compile(r"^\s*PGM\b")
-    re_cl_verify = re.compile(r"^\s*(DCL|CHGVAR|CALL|MONMSG|CHGDTAARA|RTVDTAARA)\b")
+    re_cl_verify = re.compile(
+        r"^\s*(DCL\w*|CHGVAR|CALLPRC|CALL\b|MONMSG|CHGDTAARA|RTVDTAARA|"
+        r"SNDPGMMSG|RCVMSG|OVRDBF|DLTOVR|IF\b|ELSE\b|DO\b|ENDDO|"
+        r"GOTO|CHGJOB|ADDLIBLE|RMVLIBLE|SBMJOB|RTVJOBA)\b"
+    )
 
     starts = []  # (rec_idx, type, file_line, rcdnbr)
 
@@ -110,6 +114,7 @@ def parse_dds_section(records, end_idx):
     """Parse DDS components from records[0..end_idx)."""
     re_rec_fmt = re.compile(r"^A\s+R\s+(\w+)")
     re_pfile = re.compile(r"PFILE\((\w+)\)")
+    re_jfile = re.compile(r"JFILE\(([^)]+)\)")
     re_ref = re.compile(r"REF\((\w+)\)")
     re_key = re.compile(r"^A\s+K\s+(\w+)")
     re_unique = re.compile(r"\bUNIQUE\b")
@@ -140,10 +145,16 @@ def parse_dds_section(records, end_idx):
                 pass
 
         # Record format start
+        # Scan for TEXT on any line (not just record format lines)
+        text_m_any = re_text.search(ct)
+        if text_m_any and current and not current.get("text"):
+            current["text"] = text_m_any.group(1).strip()
+
         m = re_rec_fmt.match(ct)
         if m:
             rec_name = m.group(1)
             pfile_m = re_pfile.search(ct)
+            jfile_m = re_jfile.search(ct)
             is_sfl = bool(re_sfl.search(ct))
             is_sflctl = bool(re_sflctl.search(ct))
             text_m = re_text.search(ct)
@@ -167,12 +178,22 @@ def parse_dds_section(records, end_idx):
                 components.append(current)
 
             # Determine type
-            if pfile_m:
+            if jfile_m:
+                ctype = "DDS_LF"
+            elif pfile_m:
                 ctype = "DDS_LF"
             elif is_sfl:
                 ctype = "DDS_DSPF"
             else:
                 ctype = "DDS_PF"
+
+            # Parse JFILE targets
+            jfile_targets = []
+            if jfile_m:
+                jfile_targets = [
+                    t.strip() for t in jfile_m.group(1).split()
+                    if t.strip()
+                ]
 
             current = {
                 "record_format": rec_name,
@@ -186,6 +207,7 @@ def parse_dds_section(records, end_idx):
                 "unique": file_level_unique,
                 "ref_file": file_level_ref,
                 "pfile": pfile_m.group(1) if pfile_m else None,
+                "jfile": jfile_targets if jfile_targets else None,
                 "text": text_m.group(1).strip() if text_m else "",
                 "is_dspf": is_sfl or is_sflctl,
             }
@@ -204,6 +226,12 @@ def parse_dds_section(records, end_idx):
             pm = re_pfile.search(ct)
             if pm and not current["pfile"]:
                 current["pfile"] = pm.group(1)
+                current["type"] = "DDS_LF"
+            jm = re_jfile.search(ct)
+            if jm and not current.get("jfile"):
+                current["jfile"] = [
+                    t.strip() for t in jm.group(1).split() if t.strip()
+                ]
                 current["type"] = "DDS_LF"
             rm = re_ref.search(ct)
             if rm and not current["ref_file"]:
@@ -285,6 +313,7 @@ def parse_spool(path):
 
     re_pgmid = re.compile(r"^\s*PROGRAM-ID\.\s+(\w+)", re.IGNORECASE)
     re_proc_div = re.compile(r"^\s*PROCEDURE\s+DIVISION", re.IGNORECASE)
+    re_entry = re.compile(r"^\s*ENTRY\s+['\"](\w+)['\"]", re.IGNORECASE)
 
     # Find program boundaries
     prog_starts = find_program_starts(records)
@@ -309,6 +338,9 @@ def parse_spool(path):
             entry["record_formats"] = comp["record_formats"]
         if comp.get("pfile"):
             entry["base_pf"] = comp["pfile"]
+        if comp.get("jfile"):
+            entry["jfile"] = comp["jfile"]
+            entry["is_join"] = True
         if comp.get("keys"):
             entry["keys"] = comp["keys"]
         if comp.get("unique"):
@@ -333,6 +365,7 @@ def parse_spool(path):
             # Find PROGRAM-ID
             pgm_name = "UNKNOWN"
             proc_div_line = None
+            entry_points = []
             for j in range(rec_idx, min(rec_idx + 30, next_rec_idx)):
                 fl, rn, ct = records[j]
                 m = re_pgmid.match(ct)
@@ -340,12 +373,14 @@ def parse_spool(path):
                     pgm_name = m.group(1).rstrip(".")
                     break
 
-            # Find PROCEDURE DIVISION
+            # Find PROCEDURE DIVISION and ENTRY points
             for j in range(rec_idx, next_rec_idx):
                 fl, rn, ct = records[j]
                 if re_proc_div.match(ct):
                     proc_div_line = fl
-                    break
+                em = re_entry.match(ct)
+                if em:
+                    entry_points.append(em.group(1))
 
             entry = {
                 "type": "COBOL_PROGRAM",
@@ -355,31 +390,58 @@ def parse_spool(path):
             }
             if proc_div_line:
                 entry["proc_div_line"] = proc_div_line
+            if entry_points:
+                entry["entry_points"] = entry_points
+                entry["is_subprogram"] = True
             all_components.append(entry)
 
         elif prog_type == "CL":
-            # Infer CL name from CALL PGM() or ENDPGM label
+            # Infer CL name from PGM label, ENDPGM label, or CALL PGM()
             cl_name = "UNKNOWN"
-            for j in range(rec_idx, next_rec_idx):
-                fl, rn, ct = records[j]
-                # ENDPGM label
-                em = re.match(r"^\s*(\w+):\s+ENDPGM", ct)
-                if em:
-                    cl_name = em.group(1)
-                    break
-                # CALL PGM()
-                cm = re.search(r"CALL\s+PGM\((\w+)\)", ct)
-                if cm:
-                    called = cm.group(1)
-                    cl_name = called + "CL"
-                    break
+            re_pgm_label = re.compile(r"^\s*(\w+):\s+PGM\b")
+            re_endpgm_label = re.compile(r"^\s*(\w+):\s+ENDPGM")
+            re_cl_call = re.compile(r"CALL\s+PGM\((\w+)\)")
+            re_sbmjob = re.compile(r"SBMJOB\s+CMD\(CALL\s+PGM\((\w+)\)")
+            re_ovrdbf = re.compile(r"OVRDBF\s+FILE\((\w+)\)")
 
-            all_components.append({
+            cl_calls = []
+            cl_overrides = []
+            for j in range(rec_idx, min(next_rec_idx, rec_idx + 100)):
+                fl, rn, ct = records[j]
+                # PGM label at start
+                pm = re_pgm_label.match(ct)
+                if pm and cl_name == "UNKNOWN":
+                    cl_name = pm.group(1)
+                # ENDPGM label
+                em = re_endpgm_label.match(ct)
+                if em and cl_name == "UNKNOWN":
+                    cl_name = em.group(1)
+                # CALL PGM()
+                cm = re_cl_call.search(ct)
+                if cm:
+                    cl_calls.append(cm.group(1))
+                    if cl_name == "UNKNOWN":
+                        cl_name = cm.group(1) + "CL"
+                # SBMJOB CMD(CALL PGM())
+                sm = re_sbmjob.search(ct)
+                if sm:
+                    cl_calls.append(sm.group(1))
+                # OVRDBF
+                om = re_ovrdbf.search(ct)
+                if om:
+                    cl_overrides.append(om.group(1))
+
+            cl_entry = {
                 "type": "CL_PROGRAM",
                 "name": cl_name,
                 "line_start": start_line,
                 "line_end": end_line,
-            })
+            }
+            if cl_calls:
+                cl_entry["calls"] = list(set(cl_calls))
+            if cl_overrides:
+                cl_entry["overrides"] = list(set(cl_overrides))
+            all_components.append(cl_entry)
 
     # Sort by line_start
     all_components.sort(key=lambda x: x["line_start"])
@@ -388,8 +450,16 @@ def parse_spool(path):
     summary = {
         "dds_pf": sum(1 for c in all_components if c["type"] == "DDS_PF"),
         "dds_lf": sum(1 for c in all_components if c["type"] == "DDS_LF"),
+        "dds_join_lf": sum(
+            1 for c in all_components
+            if c["type"] == "DDS_LF" and c.get("is_join")
+        ),
         "dds_dspf": sum(1 for c in all_components if c["type"] == "DDS_DSPF"),
         "cobol": sum(1 for c in all_components if c["type"] == "COBOL_PROGRAM"),
+        "cobol_subprograms": sum(
+            1 for c in all_components
+            if c["type"] == "COBOL_PROGRAM" and c.get("is_subprogram")
+        ),
         "cl": sum(1 for c in all_components if c["type"] == "CL_PROGRAM"),
     }
 

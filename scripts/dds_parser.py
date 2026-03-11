@@ -231,7 +231,7 @@ def _parse_dds_record(dds: str, is_dspf: bool = False) -> dict:
 
     # Name type (col 17, index 16)
     nt = dds[_O_NAMETYPE]
-    r['name_type'] = nt if nt in ('R', 'K', 'S', 'O') else ''
+    r['name_type'] = nt if nt in ('R', 'K', 'S', 'O', 'J') else ''
 
     # Name (cols 19-28, indices 18-27)
     r['name'] = dds[_O_NAME_START:_O_NAME_END].strip()
@@ -412,7 +412,10 @@ def parse_physical_logical(dds_records: list[str], metadata: dict) -> dict:
         'record_format': None,
         'ref_file': None,
         'pfile': None,
+        'jfile': None,
+        'join_specs': [],
         'unique': False,
+        'dynslt': False,
         'text': None,
         'fields': [],
         'keys': [],
@@ -441,6 +444,13 @@ def parse_physical_logical(dds_records: list[str], metadata: dict) -> dict:
             pfile = _extract_keyword(kw, 'PFILE')
             if pfile is not None:
                 result['pfile'] = pfile
+            # JFILE (JOIN logical file)
+            jfile = _extract_keyword(kw, 'JFILE')
+            if jfile is not None:
+                result['jfile'] = jfile
+            # DYNSLT (dynamic select)
+            if _extract_keyword(kw, 'DYNSLT') is not None:
+                result['dynslt'] = True
             # Continuation for previous field
             if current_field and kw.strip():
                 _apply_field_keywords(current_field, kw)
@@ -455,6 +465,30 @@ def parse_physical_logical(dds_records: list[str], metadata: dict) -> dict:
             pfile = _extract_keyword(kw, 'PFILE')
             if pfile is not None:
                 result['pfile'] = pfile
+            jfile = _extract_keyword(kw, 'JFILE')
+            if jfile is not None:
+                result['jfile'] = jfile
+            current_field = None
+            continue
+
+        # --- JOIN specification (name_type 'J') ---
+        if name_type == 'J':
+            # J-spec: JOIN(from to) with JFLD on continuation
+            join_val = _extract_keyword(kw, 'JOIN')
+            jfld_val = _extract_keyword(kw, 'JFLD')
+            join_entry = {}
+            if join_val:
+                parts = join_val.split()
+                if len(parts) >= 2:
+                    join_entry['from_file'] = parts[0]
+                    join_entry['to_file'] = parts[1]
+            if jfld_val:
+                parts = jfld_val.split()
+                if len(parts) >= 2:
+                    join_entry['from_field'] = parts[0]
+                    join_entry['to_field'] = parts[1]
+            if join_entry:
+                result['join_specs'].append(join_entry)
             current_field = None
             continue
 
@@ -538,6 +572,58 @@ def _apply_field_keywords(field: dict, kw_raw: str):
     edtwrd = _extract_quoted_value(kw_raw, 'EDTWRD')
     if edtwrd is not None:
         field['edtwrd'] = edtwrd
+
+    # DATFMT / TIMFMT
+    datfmt = _extract_keyword(kw_raw, 'DATFMT')
+    if datfmt is not None:
+        field['datfmt'] = datfmt
+
+    timfmt = _extract_keyword(kw_raw, 'TIMFMT')
+    if timfmt is not None:
+        field['timfmt'] = timfmt
+
+    # DFT (default value)
+    dft = _extract_keyword(kw_raw, 'DFT')
+    if dft is not None:
+        # Strip quotes if present
+        m = re.match(r"^'(.*)'$", dft.strip())
+        field['dft'] = m.group(1) if m else dft.strip()
+
+    # Validation keywords: CHECK, RANGE, VALUES, COMP
+    check = _extract_keyword(kw_raw, 'CHECK')
+    if check is not None:
+        field['check'] = check
+
+    range_val = _extract_keyword(kw_raw, 'RANGE')
+    if range_val is not None:
+        field['range'] = range_val
+
+    values_val = _extract_keyword(kw_raw, 'VALUES')
+    if values_val is not None:
+        field['values'] = values_val
+
+    comp_val = _extract_keyword(kw_raw, 'COMP')
+    if comp_val is not None:
+        field['comp'] = comp_val
+
+    # CONCAT (logical file: combine multiple physical fields)
+    concat = _extract_keyword(kw_raw, 'CONCAT')
+    if concat is not None:
+        field['concat'] = concat
+
+    # SST (logical file: substring of physical field)
+    sst = _extract_keyword(kw_raw, 'SST')
+    if sst is not None:
+        field['sst'] = sst
+
+    # ALWNULL
+    if _extract_keyword(kw_raw, 'ALWNULL') is not None:
+        field['alwnull'] = True
+
+    # CCSID
+    ccsid = _extract_keyword(kw_raw, 'CCSID')
+    if ccsid is not None:
+        field['ccsid'] = ccsid
 
 
 # ---------------------------------------------------------------------------

@@ -86,8 +86,39 @@ RE_COPY = re.compile(
     r"COPY\s+([\w-]+)\s+(?:OF\s+([\w-]+))?", re.IGNORECASE
 )
 RE_COPY_SIMPLE = re.compile(r"COPY\s+([\w-]+)\s*\.", re.IGNORECASE)
-# CALL "program" USING ...
+# CALL "program" USING ... (literal call)
 RE_CALL = re.compile(r'CALL\s+["\'](\w+)["\']', re.IGNORECASE)
+# CALL variable USING ... (dynamic call)
+RE_CALL_DYNAMIC = re.compile(r'CALL\s+([A-Z][\w-]+)(?:\s+USING|\s*\.)', re.IGNORECASE)
+# EXEC SQL ... END-EXEC
+RE_EXEC_SQL = re.compile(r'EXEC\s+SQL', re.IGNORECASE)
+RE_END_EXEC = re.compile(r'END-EXEC', re.IGNORECASE)
+# COMMIT / ROLLBACK
+RE_COMMIT = re.compile(r'\bCOMMIT\b', re.IGNORECASE)
+RE_ROLLBACK = re.compile(r'\bROLLBACK\b', re.IGNORECASE)
+# ACCEPT FROM DATE/TIME/DAY/DAY-OF-WEEK / DISPLAY UPON
+RE_ACCEPT_FROM = re.compile(
+    r'ACCEPT\s+([\w-]+)\s+FROM\s+(DATE|TIME|DAY(?:-OF-WEEK)?|LOCAL-DATA|COMMAND-LINE)',
+    re.IGNORECASE,
+)
+RE_DISPLAY_UPON = re.compile(
+    r'DISPLAY\s+.*?\s+UPON\s+([\w-]+)', re.IGNORECASE
+)
+# 88-level condition names
+RE_88_LEVEL = re.compile(
+    r'88\s+([\w-]+)\s+VALUE\s+(.*)', re.IGNORECASE
+)
+# REDEFINES
+RE_REDEFINES = re.compile(
+    r'(\d{2})\s+([\w-]+)\s+REDEFINES\s+([\w-]+)', re.IGNORECASE
+)
+# PERFORM THRU/THROUGH
+RE_PERFORM_THRU = re.compile(
+    r'PERFORM\s+([\w-]+)\s+(?:THRU|THROUGH)\s+([\w-]+)', re.IGNORECASE
+)
+# SPECIAL-NAMES LOCAL-DATA
+RE_SPECIAL_NAMES = re.compile(r'SPECIAL-NAMES', re.IGNORECASE)
+RE_LOCAL_DATA = re.compile(r'LOCAL-DATA', re.IGNORECASE)
 # Level number + field name + PIC
 RE_LEVEL_FIELD = re.compile(
     r"(\d{2})\s+([\w-]+)\s*(?:\.\s*$|.*?PIC\s+([\w()\.SV9X+-]+))",
@@ -397,7 +428,7 @@ def parse_fd_entries(records, file_start, file_end):
 # ---------------------------------------------------------------------------
 
 def extract_copy_members(records, start_idx, end_idx):
-    """Extract all COPY member names from a range of records."""
+    """Extract all COPY member names (with library info) from a range of records."""
     members = []
     seen = set()
     for i in range(start_idx, end_idx):
@@ -409,10 +440,15 @@ def extract_copy_members(records, start_idx, end_idx):
         m = RE_COPY.search(cleaned)
         if m:
             member_name = m.group(1)
+            library = m.group(2) if m.group(2) else None
             # Skip DD-* format references (these are DDS record format copies)
             if not member_name.upper().startswith("DD-"):
                 if member_name not in seen:
-                    members.append(member_name)
+                    if library:
+                        members.append({"name": member_name, "library": library})
+                    else:
+                        # Try simple COPY name. match
+                        members.append(member_name)
                     seen.add(member_name)
     return members
 
@@ -471,10 +507,12 @@ def parse_linkage_fields(records, link_start, link_end):
 # ---------------------------------------------------------------------------
 
 def extract_key_variables(records, ws_start, ws_end):
-    """Extract switches, counters, and work tables from WORKING-STORAGE."""
+    """Extract switches, counters, work tables, 88-levels, and REDEFINES from WORKING-STORAGE."""
     switches = []
     counters = []
     work_tables = []
+    condition_names = []   # 88-level
+    redefines = []         # REDEFINES
     seen_sw = set()
     seen_ct = set()
     seen_wt = set()
@@ -484,6 +522,8 @@ def extract_key_variables(records, ws_start, ws_end):
     )
     re_occurs = re.compile(r"OCCURS\s+(\d+)", re.IGNORECASE)
     re_pic = re.compile(r"PIC\s+([\w()\.SV9X+-]+)", re.IGNORECASE)
+
+    last_parent_field = None
 
     for i in range(ws_start, ws_end):
         fl, rn, ct = records[i]
@@ -497,6 +537,30 @@ def extract_key_variables(records, ws_start, ws_end):
 
         level = m.group(1)
         name = m.group(2)
+
+        # 88-level condition names
+        if level == "88":
+            m88 = RE_88_LEVEL.match(cleaned)
+            if m88:
+                condition_names.append({
+                    "name": m88.group(1),
+                    "values": m88.group(2).rstrip(".").strip(),
+                    "parent": last_parent_field,
+                })
+            continue
+
+        # REDEFINES
+        m_redef = RE_REDEFINES.match(cleaned)
+        if m_redef:
+            redefines.append({
+                "level": m_redef.group(1),
+                "name": m_redef.group(2),
+                "redefines": m_redef.group(3),
+            })
+
+        # Track parent field for 88-level
+        if level != "88":
+            last_parent_field = name
 
         # Work tables with OCCURS
         occ_m = re_occurs.search(cleaned)
@@ -525,6 +589,8 @@ def extract_key_variables(records, ws_start, ws_end):
         "switches": switches,
         "counters": counters,
         "work_tables": work_tables,
+        "condition_names_88": condition_names,
+        "redefines": redefines,
     }
 
 
@@ -601,7 +667,8 @@ def classify_paragraph_group(name):
 
 
 def parse_procedure_division(records, proc_start, proc_end):
-    """Parse paragraphs and CALL statements from PROCEDURE DIVISION.
+    """Parse paragraphs, CALLs, SQL, COMMIT/ROLLBACK, ACCEPT FROM, PERFORM THRU
+    from PROCEDURE DIVISION.
 
     A key challenge is distinguishing paragraph names from continuation lines.
     In COBOL, a paragraph name appears at margin A (columns 8-11) as a word
@@ -615,12 +682,21 @@ def parse_procedure_division(records, proc_start, proc_end):
     """
     paragraphs = []
     calls = []
+    sql_statements = []
+    commit_rollback = []
+    accept_from_list = []
+    perform_thru_list = []
 
     # Current paragraph context for associating CALLs
     current_para = None
 
     # Track whether the previous statement was complete
     prev_statement_ended = True  # Start of PROCEDURE DIVISION is a boundary
+
+    # EXEC SQL multi-line accumulation
+    in_exec_sql = False
+    sql_buffer = ""
+    sql_start_line = None
 
     for i in range(proc_start, proc_end):
         fl, rn, ct = records[i]
@@ -637,16 +713,40 @@ def parse_procedure_division(records, proc_start, proc_end):
         if cleaned == "/":
             continue
 
+        # --- EXEC SQL detection (multi-line) ---
+        if RE_EXEC_SQL.search(cleaned):
+            in_exec_sql = True
+            sql_buffer = cleaned
+            sql_start_line = fl
+            # Check if END-EXEC on same line
+            if RE_END_EXEC.search(cleaned):
+                in_exec_sql = False
+                sql_type = _classify_sql(sql_buffer)
+                sql_statements.append({
+                    "type": sql_type,
+                    "line": sql_start_line,
+                    "paragraph": current_para,
+                })
+                sql_buffer = ""
+            continue
+        if in_exec_sql:
+            sql_buffer += " " + cleaned
+            if RE_END_EXEC.search(cleaned):
+                in_exec_sql = False
+                sql_type = _classify_sql(sql_buffer)
+                sql_statements.append({
+                    "type": sql_type,
+                    "line": sql_start_line,
+                    "paragraph": current_para,
+                })
+                sql_buffer = ""
+            continue
+
         # Detect paragraph names:
-        # A paragraph name is a word (possibly with hyphens) followed by a period,
-        # at the start of content. It can ONLY appear when the previous statement
-        # was terminated (i.e., prev_statement_ended is True).
         para_m = re.match(r"^([A-Z0-9][\w-]+)\s*\.\s*$", cleaned, re.IGNORECASE)
         if para_m and prev_statement_ended:
             name = para_m.group(1)
             if is_paragraph_name(name):
-                # Accept names with numeric or alphanumeric prefix pattern
-                # (e.g., 0000-START, 3C00-READ-FALD, 3E10-READ-NEXT)
                 has_structured_prefix = bool(
                     re.match(r"[0-9][0-9A-Fa-f]{0,3}-", name)
                 )
@@ -660,7 +760,7 @@ def parse_procedure_division(records, proc_start, proc_end):
                     paragraphs.append(para_entry)
                     current_para = name
 
-        # Detect CALL statements
+        # Detect CALL statements (literal)
         call_m = RE_CALL.search(cleaned)
         if call_m:
             target = call_m.group(1)
@@ -668,17 +768,106 @@ def parse_procedure_division(records, proc_start, proc_end):
                 "target": target,
                 "line": fl,
                 "rcdnbr": rn,
+                "call_type": "literal",
             }
             if current_para:
                 call_entry["paragraph"] = current_para
             calls.append(call_entry)
+        else:
+            # Detect dynamic CALL (CALL variable)
+            dyn_m = RE_CALL_DYNAMIC.search(cleaned)
+            if dyn_m:
+                var_name = dyn_m.group(1)
+                # Exclude known COBOL keywords that might match
+                if var_name.upper() not in COBOL_VERBS and var_name.upper() not in SCOPE_TERMINATORS:
+                    call_entry = {
+                        "target": var_name,
+                        "line": fl,
+                        "rcdnbr": rn,
+                        "call_type": "dynamic",
+                    }
+                    if current_para:
+                        call_entry["paragraph"] = current_para
+                    calls.append(call_entry)
+
+        # Detect COMMIT/ROLLBACK
+        if RE_COMMIT.search(cleaned) and not RE_EXEC_SQL.search(cleaned):
+            commit_rollback.append({
+                "type": "COMMIT",
+                "line": fl,
+                "paragraph": current_para,
+            })
+        if RE_ROLLBACK.search(cleaned) and not RE_EXEC_SQL.search(cleaned):
+            commit_rollback.append({
+                "type": "ROLLBACK",
+                "line": fl,
+                "paragraph": current_para,
+            })
+
+        # Detect ACCEPT FROM
+        acc_m = RE_ACCEPT_FROM.search(cleaned)
+        if acc_m:
+            accept_from_list.append({
+                "target_var": acc_m.group(1),
+                "source": acc_m.group(2).upper(),
+                "line": fl,
+                "paragraph": current_para,
+            })
+
+        # Detect PERFORM THRU/THROUGH
+        thru_m = RE_PERFORM_THRU.search(cleaned)
+        if thru_m:
+            perform_thru_list.append({
+                "from": thru_m.group(1),
+                "to": thru_m.group(2),
+                "line": fl,
+                "paragraph": current_para,
+            })
 
         # Update statement termination tracking
-        # A COBOL statement ends with a period. Check if this line ends with one.
         stripped = cleaned.rstrip()
         prev_statement_ended = stripped.endswith(".")
 
-    return paragraphs, calls
+    return {
+        "paragraphs": paragraphs,
+        "calls": calls,
+        "sql_statements": sql_statements,
+        "commit_rollback": commit_rollback,
+        "accept_from": accept_from_list,
+        "perform_thru": perform_thru_list,
+    }
+
+
+def _classify_sql(sql_text):
+    """Classify an EXEC SQL block by its SQL statement type."""
+    upper = sql_text.upper()
+    if "DECLARE" in upper and "CURSOR" in upper:
+        return "DECLARE CURSOR"
+    if "OPEN" in upper:
+        # Distinguish SQL OPEN (cursor) from COBOL OPEN (file)
+        if "EXEC" in upper:
+            return "OPEN CURSOR"
+    if "FETCH" in upper:
+        return "FETCH"
+    if "CLOSE" in upper:
+        return "CLOSE CURSOR"
+    if "INSERT" in upper:
+        return "INSERT"
+    if "UPDATE" in upper:
+        return "UPDATE"
+    if "DELETE" in upper:
+        return "DELETE"
+    if "SELECT" in upper:
+        if "INTO" in upper:
+            return "SELECT INTO"
+        return "SELECT"
+    if "COMMIT" in upper:
+        return "COMMIT"
+    if "ROLLBACK" in upper:
+        return "ROLLBACK"
+    if "INCLUDE" in upper:
+        return "INCLUDE"
+    return "OTHER"
 
 
 # ---------------------------------------------------------------------------
@@ -900,9 +1089,28 @@ def extract_skeleton(spool_path, program_name=None):
     # ---- Build file details by merging SELECT + FD + OPEN info ----
     files_info = _build_file_details(selects, records, start_idx, end_idx)
 
+    # ---- ENVIRONMENT DIVISION: SPECIAL-NAMES LOCAL-DATA detection ----
+    has_local_data = False
+    special_names_info = {}
+    if "ENVIRONMENT" in divs:
+        env_s, env_e = divs["ENVIRONMENT"]
+        for i in range(env_s, env_e):
+            fl_e, rn_e, ct_e = records[i]
+            cleaned_e = clean_content(ct_e)
+            if is_comment(ct_e):
+                continue
+            if RE_LOCAL_DATA.search(cleaned_e):
+                has_local_data = True
+            if RE_SPECIAL_NAMES.search(cleaned_e):
+                special_names_info["line"] = fl_e
+
     # ---- PROCEDURE DIVISION ----
     paragraphs = []
     calls = []
+    sql_statements = []
+    commit_rollback = []
+    accept_from_list = []
+    perform_thru_list = []
     proc_using = None
     has_main_loop = False
 
@@ -924,7 +1132,13 @@ def extract_skeleton(spool_path, program_name=None):
                 has_main_loop = True
                 break
 
-        paragraphs, calls = parse_procedure_division(records, proc_s, proc_e)
+        proc_result = parse_procedure_division(records, proc_s, proc_e)
+        paragraphs = proc_result["paragraphs"]
+        calls = proc_result["calls"]
+        sql_statements = proc_result["sql_statements"]
+        commit_rollback = proc_result["commit_rollback"]
+        accept_from_list = proc_result["accept_from"]
+        perform_thru_list = proc_result["perform_thru"]
 
     # ---- Determine program type ----
     prog_type, type_evidence = determine_program_type(
@@ -968,6 +1182,7 @@ def extract_skeleton(spool_path, program_name=None):
         {
             "target": c["target"],
             "line": c["line"],
+            "call_type": c.get("call_type", "literal"),
             **({"paragraph": c["paragraph"]} if "paragraph" in c else {}),
         }
         for c in unique_calls
@@ -975,6 +1190,26 @@ def extract_skeleton(spool_path, program_name=None):
 
     result["copy_members"] = copy_members
     result["key_variables"] = key_vars
+
+    # ---- New: SQL statements ----
+    if sql_statements:
+        result["sql_statements"] = sql_statements
+
+    # ---- New: COMMIT/ROLLBACK (transaction boundaries) ----
+    if commit_rollback:
+        result["commit_rollback"] = commit_rollback
+
+    # ---- New: ACCEPT FROM (system date/time/LDA) ----
+    if accept_from_list:
+        result["accept_from"] = accept_from_list
+
+    # ---- New: PERFORM THRU ----
+    if perform_thru_list:
+        result["perform_thru"] = perform_thru_list
+
+    # ---- New: SPECIAL-NAMES / LOCAL-DATA ----
+    if has_local_data:
+        result["has_local_data"] = True
 
     return result
 

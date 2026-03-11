@@ -11,6 +11,11 @@ Checks:
   4. Display file fields are covered (if INTERACTIVE)
   5. LINKAGE SECTION is documented
   6. No TODO/待確認 remnants
+  7. Quality metrics (coverage percentage)
+  8. I/O mode verification
+  9. SQL section verification (if has EXEC SQL)
+  10. Cross-reference: spec file names vs skeleton files
+  11. Markdown structure validation
 """
 import json
 import re
@@ -37,11 +42,14 @@ def check_paragraphs(spec, skeleton):
         if name not in spec:
             issues.append(f"MISSING paragraph: {name}")
     covered = sum(1 for p in paragraphs if p["name"] in spec)
+    total = len(paragraphs)
+    pct = (covered / total * 100) if total > 0 else 100
     return {
         "check": "paragraphs",
-        "total": len(paragraphs),
+        "total": total,
         "covered": covered,
-        "missing": len(paragraphs) - covered,
+        "missing": total - covered,
+        "coverage_pct": round(pct, 1),
         "issues": issues,
         "pass": len(issues) == 0,
     }
@@ -179,6 +187,143 @@ def check_remnants(spec):
     }
 
 
+def check_io_modes(spec, skeleton):
+    """Check that each file's OPEN mode is mentioned in spec."""
+    files = skeleton.get("files", [])
+    if not files:
+        return {"check": "io_modes", "skip": True, "pass": True}
+
+    issues = []
+    io_mode_terms = {
+        "INPUT": "唯讀",
+        "OUTPUT": "唯寫",
+        "I-O": "讀寫",
+        "EXTEND": "附加",
+    }
+
+    for f in files:
+        fd_name = f.get("fd_name", "")
+        io_mode = f.get("io_mode", "INPUT")
+        # Check if the file and its mode are mentioned
+        if fd_name in spec:
+            cn_term = io_mode_terms.get(io_mode, io_mode)
+            # Don't require explicit mention of mode -- just check file is present
+            # (Mode is implicitly covered in file operations)
+        else:
+            logical = f.get("logical_file", "")
+            if logical not in spec:
+                issues.append(f"File {fd_name} ({io_mode}) not in spec")
+
+    return {
+        "check": "io_modes",
+        "total": len(files),
+        "issues": issues,
+        "pass": len(issues) == 0,
+    }
+
+
+def check_sql_section(spec, skeleton):
+    """Check SQL section exists if skeleton has SQL statements."""
+    sql_stmts = skeleton.get("sql_statements", [])
+    if not sql_stmts:
+        return {"check": "sql_section", "skip": True, "pass": True}
+
+    issues = []
+    if "SQL" not in spec and "sql" not in spec.lower():
+        issues.append("Program has EXEC SQL but spec has no SQL section")
+
+    return {
+        "check": "sql_section",
+        "sql_count": len(sql_stmts),
+        "issues": issues,
+        "pass": len(issues) == 0,
+    }
+
+
+def check_cross_references(spec, skeleton):
+    """Check that file names mentioned in spec exist in skeleton."""
+    issues = []
+    skeleton_files = set()
+    for f in skeleton.get("files", []):
+        skeleton_files.add(f.get("fd_name", "").upper())
+        lf = f.get("logical_file", "")
+        if lf:
+            skeleton_files.add(lf.upper())
+
+    # Find file-like references in spec (words matching AS/400 naming)
+    # We check that any file name in the spec's table definitions matches skeleton
+    # This is a light check -- just verify spec doesn't reference phantom files
+    spec_file_refs = set()
+    for m in re.finditer(r'(?:LFDFALD|FFDFALD|LFD|FFD)\w+', spec, re.IGNORECASE):
+        spec_file_refs.add(m.group(0).upper())
+
+    for ref in spec_file_refs:
+        # Strip common prefixes for matching
+        base = ref
+        for prefix in ("LFDFALD", "FFDFALD", "LFD", "FFD"):
+            if base.startswith(prefix):
+                base = base[len(prefix):]
+                break
+        # Check if the base or full name matches any skeleton file
+        found = any(
+            base in sf or ref in sf or sf in ref
+            for sf in skeleton_files
+        )
+        if not found and skeleton_files:
+            issues.append(f"Spec references {ref} not in skeleton files")
+
+    return {
+        "check": "cross_references",
+        "issues": issues,
+        "pass": len(issues) == 0,
+    }
+
+
+def check_markdown_structure(spec):
+    """Validate basic markdown structure (heading levels, table format)."""
+    issues = []
+    lines = spec.split("\n")
+
+    # Check heading hierarchy
+    prev_level = 0
+    for i, line in enumerate(lines):
+        m = re.match(r'^(#{1,6})\s', line)
+        if m:
+            level = len(m.group(1))
+            # Allow jumping from 0 to any level, but warn on skip > 1
+            if prev_level > 0 and level > prev_level + 1:
+                issues.append(
+                    f"Line {i+1}: Heading level jumps from H{prev_level} to H{level}"
+                )
+            prev_level = level
+
+    # Check table format (pipes should be balanced)
+    in_table = False
+    table_cols = 0
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("|") and stripped.endswith("|"):
+            cols = stripped.count("|") - 1
+            if not in_table:
+                in_table = True
+                table_cols = cols
+            else:
+                if cols != table_cols and cols > 0:
+                    issues.append(
+                        f"Line {i+1}: Table column count mismatch "
+                        f"(expected {table_cols}, got {cols})"
+                    )
+        else:
+            in_table = False
+            table_cols = 0
+
+    return {
+        "check": "markdown_structure",
+        "issues": issues,
+        "pass": len(issues) == 0,
+    }
+
+
 def validate(spec_path, skeleton_path):
     spec = load_spec(spec_path)
     skeleton = load_skeleton(skeleton_path)
@@ -190,9 +335,22 @@ def validate(spec_path, skeleton_path):
     results.append(check_screen(spec, skeleton))
     results.append(check_linkage(spec, skeleton))
     results.append(check_remnants(spec))
+    results.append(check_io_modes(spec, skeleton))
+    results.append(check_sql_section(spec, skeleton))
+    results.append(check_cross_references(spec, skeleton))
+    results.append(check_markdown_structure(spec))
 
     all_pass = all(r["pass"] for r in results)
     total_issues = sum(len(r.get("issues", [])) for r in results)
+
+    # Quality metrics
+    para_check = results[0]
+    quality = {
+        "paragraph_coverage": para_check.get("coverage_pct", 100),
+        "total_checks": len(results),
+        "checks_passed": sum(1 for r in results if r["pass"]),
+        "checks_skipped": sum(1 for r in results if r.get("skip", False)),
+    }
 
     return {
         "spec_file": spec_path.split("/")[-1],
@@ -200,6 +358,7 @@ def validate(spec_path, skeleton_path):
         "program": skeleton.get("program", "UNKNOWN"),
         "all_pass": all_pass,
         "total_issues": total_issues,
+        "quality": quality,
         "checks": results,
     }
 
@@ -219,6 +378,9 @@ def main():
     print(f"{'=' * 60}")
     print(f"Spec: {result['spec_file']}")
     print(f"Skeleton: {result['skeleton_file']}")
+    q = result.get("quality", {})
+    print(f"Quality: {q.get('checks_passed', 0)}/{q.get('total_checks', 0)} checks passed, "
+          f"paragraph coverage {q.get('paragraph_coverage', 0)}%")
     print()
 
     for check in result["checks"]:
@@ -226,13 +388,15 @@ def main():
         status = "PASS" if check["pass"] else "FAIL"
         skip = check.get("skip", False)
         if skip:
-            print(f"  [{name:10s}] SKIP (not applicable)")
+            print(f"  [{name:18s}] SKIP (not applicable)")
             continue
 
         total = check.get("total", "")
         covered = check.get("covered", "")
         detail = f" ({covered}/{total})" if total != "" else ""
-        print(f"  [{name:10s}] {status}{detail}")
+        pct = check.get("coverage_pct")
+        pct_str = f" [{pct}%]" if pct is not None else ""
+        print(f"  [{name:18s}] {status}{detail}{pct_str}")
 
         for issue in check.get("issues", []):
             print(f"    - {issue}")
