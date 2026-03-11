@@ -1,6 +1,8 @@
 # COBOL Spec Generator
 
-一個 Claude Code Skill，能自動解析 AS/400 COBOL 程式並產出標準化中文規格書。
+一個 [Agent Skill](https://agentskills.io)，能自動解析 AS/400 COBOL 程式並產出標準化中文規格書。
+
+採用開放標準 Agent Skills 格式，相容於 **Claude Code**、**GitHub Copilot**、**Cursor**、**Gemini CLI** 等 20+ 種 AI 工具。
 
 ## 功能
 
@@ -15,27 +17,68 @@
 
 ### 前置需求
 
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)
 - Python 3.9+（無需額外套件）
+- 任一支援 Agent Skills 的 AI 工具（見下方相容性列表）
 
-### 安裝步驟
+### 方法一：Claude Code
 
 ```bash
-# 1. Clone 到 Claude Code skills 目錄
-git clone git@github.com:<your-username>/cobol-spec-skill.git ~/.claude/skills/cobol-spec
-
-# 2. 確認 skill 已被載入
-claude  # 啟動 Claude Code，輸入 /cobol-spec 應可觸發
+git clone https://github.com/ian20111999/cobol-spec-skill.git ~/.claude/skills/cobol-spec
 ```
 
-> **注意**：若你的 `~/.claude/skills/` 目錄尚不存在，先建立它：`mkdir -p ~/.claude/skills`
+啟動 Claude Code，輸入 `/cobol-spec` 即可觸發。
+
+### 方法二：GitHub Copilot（VS Code）
+
+**個人安裝**（所有專案都能使用）：
+
+```bash
+mkdir -p ~/.copilot/skills
+git clone https://github.com/ian20111999/cobol-spec-skill.git ~/.copilot/skills/cobol-spec
+```
+
+**專案安裝**（僅限該 repo）：
+
+```bash
+mkdir -p .github/skills
+git clone https://github.com/ian20111999/cobol-spec-skill.git .github/skills/cobol-spec
+```
+
+在 VS Code Copilot Chat 中輸入 `/cobol-spec` 或描述需求，Copilot 會自動載入。
+
+### 方法三：GitHub Copilot Coding Agent
+
+將 skill 放到 repo 的 `.github/skills/cobol-spec/` 目錄下：
+
+```bash
+cd your-repo
+mkdir -p .github/skills
+git clone https://github.com/ian20111999/cobol-spec-skill.git .github/skills/cobol-spec
+rm -rf .github/skills/cobol-spec/.git  # 移除巢狀 git
+git add .github/skills/cobol-spec
+git commit -m "Add COBOL spec generator skill"
+```
+
+Copilot coding agent 會在處理相關 issue 時自動發現並使用此 skill。
+
+### 方法四：其他 AI 工具（Cursor、Gemini CLI 等）
+
+大多數支援 Agent Skills 標準的工具會搜尋以下路徑：
+
+| 工具 | 個人路徑 | 專案路徑 |
+|------|---------|---------|
+| Claude Code | `~/.claude/skills/cobol-spec/` | `.claude/skills/cobol-spec/` |
+| GitHub Copilot | `~/.copilot/skills/cobol-spec/` | `.github/skills/cobol-spec/` |
+| 通用 | `~/.agents/skills/cobol-spec/` | `.agents/skills/cobol-spec/` |
+
+Clone 到對應路徑即可。詳見 [agentskills.io](https://agentskills.io)。
 
 ## 使用方式
 
 ### 快速開始
 
 1. 將 AS/400 匯出的 Spool File（`.txt`）放到工作目錄下
-2. 在 Claude Code 中輸入：
+2. 輸入：
 
 ```
 /cobol-spec
@@ -92,7 +135,7 @@ CPYSPLF FILE(QPJOBLOG) TOFILE(QGPL/QPRINT) SPLNBR(*LAST)
 每個程式用到的 Physical File / Logical File 的 DDS 原始碼，同樣匯出為 `.txt`：
 
 ```
-WRKMBRPDM FILE(YOURLIB/QDDSSRC) MBR(FFDFALD0) → F16 列印 → 另存 .txt
+WRKMBRPDM FILE(YOURLIB/QDDSSRC) MBR(your_member) → F16 列印 → 另存 .txt
 ```
 
 > Skill 在分析時會自動檢查哪些 DDS 檔案缺少，並列出清單請你補充。
@@ -100,11 +143,7 @@ WRKMBRPDM FILE(YOURLIB/QDDSSRC) MBR(FFDFALD0) → F16 列印 → 另存 .txt
 
 ### Display File（INTERACTIVE 程式需要）
 
-線上互動程式的 DSPF 原始碼：
-
-```
-WRKMBRPDM FILE(YOURLIB/QDDSSRC) MBR(MFD0062) → F16 列印 → 另存 .txt
-```
+線上互動程式的 DSPF 原始碼，同樣匯出為 `.txt`。
 
 ## 輸出
 
@@ -154,7 +193,7 @@ python3 scripts/md2html.py <spec.md>
 
 ```
 cobol-spec/
-├── SKILL.md                    # 主 Skill 定義（Claude Code 讀取此檔）
+├── SKILL.md                    # 主 Skill 定義（AI 工具讀取此檔）
 ├── README.md                   # 本說明文件
 ├── scripts/
 │   ├── spool_splitter.py       # Spool File → inventory.json
@@ -170,6 +209,22 @@ cobol-spec/
     ├── cobol-dictionary.json   # COBOL 術語中文對照表
     └── spec-template.md        # 規格書格式模板
 ```
+
+## 相容性
+
+本 skill 採用 [Agent Skills 開放標準](https://agentskills.io)，相容於：
+
+| AI 工具 | 支援狀態 |
+|---------|---------|
+| Claude Code | 完整支援 |
+| GitHub Copilot (VS Code) | 完整支援 |
+| GitHub Copilot Coding Agent | 完整支援 |
+| Cursor | 完整支援 |
+| Gemini CLI | 完整支援 |
+| Roo Code | 完整支援 |
+| OpenHands | 完整支援 |
+
+完整相容工具清單見 [agentskills.io](https://agentskills.io)。
 
 ## 自訂與擴充
 
@@ -194,4 +249,4 @@ cobol-spec/
 
 ## License
 
-Private — 僅限受邀成員存取。
+MIT
